@@ -229,8 +229,14 @@ impl Assembler for GradSliceAssembler {
             // Set every element in xmm0 to 2 * sqrt(f(x))
             ; vbroadcastss xmm0, xmm0
 
-            // Set every element in xmm0 to -f'(x) / f(x)**2
+            // Set every element in xmm0 to f'(x) / (2 * sqrt(f(x)))
             ; vdivps xmm0, Rx(reg(lhs_reg)), xmm0
+
+            // Partial derivatives that are zero stay zero (rather than 0 / 0
+            // = NaN where f(x) is zero): keep only lanes where f'(x) != 0
+            ; vxorps xmm1, xmm1, xmm1
+            ; vcmpneqps xmm2, xmm1, Rx(reg(lhs_reg))
+            ; vandps xmm0, xmm0, xmm2
 
             // Compute the actual square root into xmm1
             ; vsqrtss xmm1, xmm1, Rx(reg(lhs_reg))

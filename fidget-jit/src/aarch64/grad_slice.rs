@@ -262,7 +262,11 @@ impl Assembler for GradSliceAssembler {
             ; fmov s7, 2.0
             ; fmul s7, s6, s7
             ; dup v7.s4, v7.s[0]
+            // Partial derivatives that are zero stay zero (rather than 0 / 0
+            // = NaN where the value is zero), so build a mask of them first
+            ; fcmeq v5.s4, V(reg(lhs_reg)).s4, 0.0
             ; fdiv V(reg(out_reg)).s4, V(reg(lhs_reg)).s4, v7.s4
+            ; bic V(reg(out_reg)).b16, V(reg(out_reg)).b16, v5.b16
             ; mov V(reg(out_reg)).S[0], v6.S[0]
         )
     }

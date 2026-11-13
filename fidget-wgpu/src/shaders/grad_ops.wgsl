@@ -21,7 +21,9 @@ fn op_recip(lhs: Value) -> Value {
 
 fn op_sqrt(lhs: Value) -> Value {
     let v = sqrt(lhs.v.w);
-    return Value(vec4f(lhs.v.xyz / (2.0 * v), v));
+    // Partial derivatives that are zero stay zero (not 0 / 0 = NaN at v = 0)
+    let d = select(lhs.v.xyz / (2.0 * v), vec3f(0.0), lhs.v.xyz == vec3f(0.0));
+    return Value(vec4f(d, v));
 }
 
 fn op_floor(lhs: Value) -> Value {

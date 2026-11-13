@@ -58,11 +58,15 @@ impl Grad {
     #[inline]
     pub fn sqrt(self) -> Self {
         let v = self.v.sqrt();
+        // A partial derivative that is zero stays zero, even where the value
+        // is zero: `sqrt(x² + y²)` at the origin, or `sqrt(max(d, 0)²)` inside
+        // a shape, would otherwise give 0 / 0 = NaN.
+        let d = |dx: f32| if dx == 0.0 { 0.0 } else { dx / (2.0 * v) };
         Grad {
             v,
-            dx: self.dx / (2.0 * v),
-            dy: self.dy / (2.0 * v),
-            dz: self.dz / (2.0 * v),
+            dx: d(self.dx),
+            dy: d(self.dy),
+            dz: d(self.dz),
         }
     }
 
