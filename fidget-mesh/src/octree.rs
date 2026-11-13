@@ -1709,23 +1709,45 @@ mod test {
     }
 
     fn count_bad_edges(mesh: &Mesh) -> (usize, usize) {
-        // (edges not used exactly once each way, triangles sharing all three vertices with another)
+        // (edges not used exactly once each way, plus vertices that aren't
+        // finite or sit exactly on another vertex; triangles that are
+        // degenerate or doubled once vertices are identified by position)
         let mut edges: BTreeMap<_, usize> = BTreeMap::new();
-        let mut tris: BTreeMap<_, usize> = BTreeMap::new();
         for t in &mesh.triangles {
             for edge in [(t.x, t.y), (t.y, t.z), (t.z, t.x)] {
                 *edges.entry(edge).or_default() += 1;
             }
-            let mut k = [t.x, t.y, t.z];
-            k.sort();
-            *tris.entry(k).or_default() += 1;
         }
-        let bad = edges
+        let bad_edges = edges
             .iter()
             .filter(|&(&(a, b), &n)| n != 1 || edges.get(&(b, a)) != Some(&1))
             .count();
-        let pairs = tris.values().filter(|&&n| n > 1).count();
-        (bad, pairs)
+        let mut at: BTreeMap<_, usize> = BTreeMap::new();
+        let mut bad_verts = 0;
+        let id: Vec<usize> = mesh
+            .vertices
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                bad_verts += !v.iter().all(|c| c.is_finite()) as usize;
+                let k = (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+                let n = at.len();
+                let j = *at.entry(k).or_insert(i);
+                bad_verts += (j != i) as usize;
+                let _ = n;
+                j
+            })
+            .collect();
+        let mut tris: BTreeMap<_, usize> = BTreeMap::new();
+        let mut bad_tris = 0;
+        for t in &mesh.triangles {
+            let mut k = [id[t.x], id[t.y], id[t.z]];
+            k.sort();
+            bad_tris += (k[0] == k[1] || k[1] == k[2]) as usize;
+            *tris.entry(k).or_default() += 1;
+        }
+        bad_tris += tris.values().filter(|&&n| n > 1).count();
+        (bad_edges + bad_verts, bad_tris)
     }
 
     fn mesh_report(name: &str, t: Tree, depth: u8) -> (usize, usize) {
@@ -1738,7 +1760,7 @@ mod test {
         let mesh = Octree::build(&shape, &settings).unwrap().walk_dual();
         let r = count_bad_edges(&mesh);
         eprintln!(
-            "{name} depth {depth}: {} triangles, {} bad edges, {} doubled triangles",
+            "{name} depth {depth}: {} triangles, {} bad edges or vertices, {} degenerate or doubled triangles",
             mesh.triangles.len(),
             r.0,
             r.1
@@ -1753,6 +1775,21 @@ mod test {
             for (name, t) in [
                 ("cylinder", cylinder(0.5, 0.6)),
                 ("thin cylinder", cylinder(0.31, 0.77)),
+                ("exact cylinder", {
+                    // as written for an exact distance field: sqrt(max(d, 0)²)
+                    // inside, which used to give NaN gradients
+                    let (x, y, z) = Tree::axes();
+                    let dr = (x.square() + y.square()).sqrt() - 0.5;
+                    let dz = z.abs() - 0.6;
+                    (dr.clone().max(0.0).square() + dz.clone().max(0.0).square()).sqrt()
+                        + dr.max(dz).min(0.0)
+                }),
+                ("exact box", {
+                    let (x, y, z) = Tree::axes();
+                    let (dx, dy, dz) = (x.abs() - 0.5, y.abs() - 0.4, z.abs() - 0.3);
+                    (dx.clone().max(0.0).square() + dy.clone().max(0.0).square() + dz.clone().max(0.0).square()).sqrt()
+                        + dx.max(dy).max(dz).min(0.0)
+                }),
                 ("touching spheres", sphere([-0.3, 0.0, 0.0], 0.3).min(sphere([0.3, 0.0, 0.0], 0.3))),
                 ("knife edge", {
                     let (x, y, z) = Tree::axes();
