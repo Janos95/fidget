@@ -146,6 +146,50 @@ impl<F: Function + MathFunction> TestGradSlice<F> {
         );
     }
 
+    pub fn test_g_sqrt_zero() {
+        let mut ctx = Context::new();
+        let x = ctx.x();
+        let y = ctx.y();
+
+        // sqrt(x² + y²) at the origin: the partial derivatives coming in are
+        // zero, so the gradient is zero too (not 0 / 0 = NaN)
+        let x2 = ctx.square(x).unwrap();
+        let y2 = ctx.square(y).unwrap();
+        let r2 = ctx.add(x2, y2).unwrap();
+        let r = ctx.sqrt(r2).unwrap();
+        let shape = F::new(&ctx, &[r]).unwrap();
+        let tape = shape.grad_slice_tape(Default::default());
+        assert_eq!(
+            Self::eval_xyz(&tape, &[0.0], &[0.0], &[0.0])[0],
+            Grad::new(0.0, 0.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            Self::eval_xyz(&tape, &[3.0], &[4.0], &[0.0])[0],
+            Grad::new(5.0, 0.6, 0.8, 0.0)
+        );
+
+        // sqrt(max(x, 0)²) where x < 0, as in an exact box distance field
+        let zero = ctx.constant(0.0);
+        let m = ctx.max(x, zero).unwrap();
+        let m2 = ctx.square(m).unwrap();
+        let s = ctx.sqrt(m2).unwrap();
+        let shape = F::new(&ctx, &[s]).unwrap();
+        let tape = shape.grad_slice_tape(Default::default());
+        assert_eq!(
+            Self::eval_xyz(&tape, &[-1.0], &[0.0], &[0.0])[0],
+            Grad::new(0.0, 0.0, 0.0, 0.0)
+        );
+
+        // a partial derivative that isn't zero still goes to infinity
+        let s = ctx.sqrt(x).unwrap();
+        let shape = F::new(&ctx, &[s]).unwrap();
+        let tape = shape.grad_slice_tape(Default::default());
+        let g = Self::eval_xyz(&tape, &[0.0], &[0.0], &[0.0])[0];
+        assert_eq!(g.v, 0.0);
+        assert_eq!(g.dx, f32::INFINITY);
+        assert_eq!((g.dy, g.dz), (0.0, 0.0));
+    }
+
     pub fn test_g_sin() {
         let mut ctx = Context::new();
         let x = ctx.x();
@@ -828,6 +872,7 @@ macro_rules! grad_slice_tests {
         $crate::grad_test!(test_g_mul, $t);
         $crate::grad_test!(test_g_min, $t);
         $crate::grad_test!(test_g_max, $t);
+        $crate::grad_test!(test_g_sqrt_zero, $t);
         $crate::grad_test!(test_g_add, $t);
         $crate::grad_test!(test_g_min_max, $t);
         $crate::grad_test!(test_g_min_max_equal, $t);

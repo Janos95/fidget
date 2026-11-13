@@ -1702,4 +1702,68 @@ mod test {
             assert!(Octree::build(&shape, &settings).is_none());
         }
     }
+
+    fn cylinder(r: f32, h: f32) -> Tree {
+        let (x, y, z) = Tree::axes();
+        ((x.square() + y.square()).sqrt() - r).max(z.abs() - h)
+    }
+
+    fn count_bad_edges(mesh: &Mesh) -> (usize, usize) {
+        // (edges not used exactly once each way, triangles sharing all three vertices with another)
+        let mut edges: BTreeMap<_, usize> = BTreeMap::new();
+        let mut tris: BTreeMap<_, usize> = BTreeMap::new();
+        for t in &mesh.triangles {
+            for edge in [(t.x, t.y), (t.y, t.z), (t.z, t.x)] {
+                *edges.entry(edge).or_default() += 1;
+            }
+            let mut k = [t.x, t.y, t.z];
+            k.sort();
+            *tris.entry(k).or_default() += 1;
+        }
+        let bad = edges
+            .iter()
+            .filter(|&(&(a, b), &n)| n != 1 || edges.get(&(b, a)) != Some(&1))
+            .count();
+        let pairs = tris.values().filter(|&&n| n > 1).count();
+        (bad, pairs)
+    }
+
+    fn mesh_report(name: &str, t: Tree, depth: u8) -> (usize, usize) {
+        let shape = tree_to_shape(t);
+        let settings = Settings {
+            depth,
+            threads: None,
+            ..Default::default()
+        };
+        let mesh = Octree::build(&shape, &settings).unwrap().walk_dual();
+        let r = count_bad_edges(&mesh);
+        eprintln!(
+            "{name} depth {depth}: {} triangles, {} bad edges, {} doubled triangles",
+            mesh.triangles.len(),
+            r.0,
+            r.1
+        );
+        r
+    }
+
+    #[test]
+    fn test_tule_reproducers() {
+        let mut fails = 0;
+        for depth in [5, 6, 7] {
+            for (name, t) in [
+                ("cylinder", cylinder(0.5, 0.6)),
+                ("thin cylinder", cylinder(0.31, 0.77)),
+                ("touching spheres", sphere([-0.3, 0.0, 0.0], 0.3).min(sphere([0.3, 0.0, 0.0], 0.3))),
+                ("knife edge", {
+                    let (x, y, z) = Tree::axes();
+                    // a wedge thinning to 0.002 at |y| = 0.8: like a chine or a wing edge
+                    (z.abs() - (0.8 - y.abs()) * 0.05 - 0.002).max(y.abs() - 0.8).max(x.abs() - 0.7)
+                }),
+            ] {
+                let (b, p) = mesh_report(name, t, depth);
+                fails += (b > 0 || p > 0) as usize;
+            }
+        }
+        assert_eq!(fails, 0);
+    }
 }
