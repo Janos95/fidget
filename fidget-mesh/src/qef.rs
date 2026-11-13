@@ -52,7 +52,12 @@ impl QuadraticErrorSolver {
     ) {
         // TODO: correct for non-zero distance value in grad.w
         self.mass_point += nalgebra::Vector4::new(pos.x, pos.y, pos.z, 1.0);
-        let norm = grad.xyz().normalize();
+        // A zero gradient (e.g. where an exact distance field is exactly zero
+        // and every term's derivative vanishes) gives no plane: normalizing it
+        // would poison the whole QEF with NaN, so only the position counts.
+        let Some(norm) = grad.xyz().try_normalize(f32::MIN_POSITIVE) else {
+            return;
+        };
         self.ata += norm * norm.transpose();
         self.atb += norm * norm.dot(&pos);
         self.btb += norm.dot(&pos).powi(2);
@@ -140,6 +145,22 @@ mod test {
         );
         let (_out, err) = q.solve();
         assert_eq!(err, 1e-6);
+    }
+
+    #[test]
+    fn qef_zero_gradient() {
+        let mut q = QuadraticErrorSolver::new();
+        q.add_intersection(
+            Vector3::new(0.5, 0.0, 0.0),
+            Vector4::new(1.0, 0.0, 0.0, 0.0),
+        );
+        q.add_intersection(
+            Vector3::new(0.5, 0.5, 0.0),
+            Vector4::new(0.0, 0.0, 0.0, 0.0),
+        );
+        let (out, _err) = q.solve();
+        assert!(out.pos.iter().all(|v| v.is_finite()), "{:?}", out.pos);
+        assert_eq!(out.pos.x, 0.5);
     }
 
     #[test]
