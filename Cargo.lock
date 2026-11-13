@@ -1559,7 +1559,6 @@ dependencies = [
  "nalgebra",
  "pollster",
  "rayon",
- "workspace-hack",
 ]
 
 [[package]]
@@ -1610,7 +1609,6 @@ dependencies = [
  "serde",
  "strum",
  "thiserror 2.0.21",
- "workspace-hack",
 ]
 
 [[package]]
@@ -1633,7 +1631,6 @@ dependencies = [
  "libc",
  "static_assertions",
  "windows",
- "workspace-hack",
 ]
 
 [[package]]
@@ -1646,7 +1643,6 @@ dependencies = [
  "ordered-float",
  "rayon",
  "static_assertions",
- "workspace-hack",
 ]
 
 [[package]]

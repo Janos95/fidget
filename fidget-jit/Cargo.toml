@@ -12,7 +12,6 @@ rust-version.workspace = true
 
 [dependencies]
 fidget-core.workspace = true
-workspace-hack.workspace = true
 
 arrayvec.workspace = true
 dynasmrt.workspace = true
