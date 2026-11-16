@@ -197,17 +197,48 @@ pub fn dc_edge<T: Frame>(
         let center = leafs[deepest].index + verts[deepest].edge.0 as usize;
         let winding = if starting_sign { 3 } else { 1 };
         let mut ring = arrayvec::ArrayVec::<usize, 4>::new();
+        let mut arcs =
+            arrayvec::ArrayVec::<(usize, ([u32; 6], usize, usize)), 4>::new();
         for k in 0..4 {
             let j = (k * winding) % 4;
-            if cs[j].index != cs[(j + winding) % 4].index {
+            let n = (j + winding) % 4;
+            if cs[j].index != cs[n].index {
                 ring.push(leafs[j].index + verts[j].vert.0 as usize);
+                if let Some(a) = arc(&cs, &leafs, &edges, deepest, j, n) {
+                    arcs.push((ring.len(), a));
+                }
             }
         }
-        for [a, b, c] in triangulate(octree, &ring, center) {
-            let a = out.vertex(a, octree);
-            let b = out.vertex(b, octree);
-            let c = out.vertex(c, octree);
-            out.triangle(a, b, c);
+        if arcs.is_empty() {
+            for [a, b, c] in triangulate(octree, &ring, center) {
+                let a = out.vertex(a, octree);
+                let b = out.vertex(b, octree);
+                let c = out.vertex(c, octree);
+                out.triangle(a, b, c);
+            }
+        } else {
+            // A fan through the arcs' vertices
+            let mut full = arrayvec::ArrayVec::<usize, 8>::new();
+            let mut arcs = arcs.into_iter().peekable();
+            for (k, &r) in ring.iter().enumerate() {
+                full.push(out.vertex(r, octree));
+                if let Some(&(_, (key, p, q))) =
+                    arcs.peek().filter(|&&(after, _)| after == k + 1)
+                {
+                    full.push(out.arc_vertex(key, || {
+                        let n = octree.normals[p] + octree.normals[q];
+                        (
+                            (octree.verts[p].pos + octree.verts[q].pos) / 2.0,
+                            n.try_normalize(1e-12).unwrap_or(n),
+                        )
+                    }));
+                    arcs.next();
+                }
+            }
+            let c = out.vertex(center, octree);
+            for k in 0..full.len() {
+                out.triangle(full[k], full[(k + 1) % full.len()], c);
+            }
         }
     } else {
         let (t, u, v) = T::frame();
@@ -225,6 +256,83 @@ pub fn dc_edge<T: Frame>(
     }
 }
 
+/// Finds whether the surface needs a vertex of its own on the face between
+/// ring cells `j` and `n` (around the edge `edges[deepest]`)
+///
+/// On an ambiguous face (inside corners diagonal from each other), the surface
+/// crosses in two arcs, each cutting off an inside corner.  If the cells on
+/// both sides use one vertex for both arcs (their surface joins the two arcs
+/// inside each cell: a tunnel through the face), those two vertices alone
+/// can't make the loop around the tunnel, and the edge between them would be
+/// shared by four triangles.  Then each arc gets a vertex on the face, between
+/// its two intersections, so the fans of the arc's two edges go through it.
+///
+/// Returns the arc's key and the octree indices of its two intersections.
+#[allow(clippy::type_complexity)]
+fn arc(
+    cs: &[CellIndex<3>; 4],
+    leafs: &[crate::cell::Leaf<3>; 4],
+    edges: &[Edge; 4],
+    deepest: usize,
+    j: usize,
+    n: usize,
+) -> Option<([u32; 6], usize, usize)> {
+    let depth = cs[deepest].depth;
+    let s = [j, n].into_iter().find(|&i| cs[i].depth == depth)?;
+    // Cells 0, 1, 2, 3 sit at (0, 0), (U, 0), (U, V), (0, V) around the edge,
+    // whose index in each cell is `4 * t + u_bit + 2 * v_bit`: across a face
+    // normal to U the opposite edge differs in its V bit, and vice versa
+    let flip = match (j.min(n), j.max(n)) {
+        (0, 1) | (2, 3) => 2,
+        _ => 1,
+    };
+    let opposite = |i: usize| Edge::new(edges[i].index() as u8 ^ flip);
+
+    // The face must be ambiguous: the inside ends of the two edges at
+    // opposite ends along the edge axis
+    let inside_corner = |e: Edge| {
+        let (a, b) = e.corners();
+        if leafs[s].mask & a { a } else { b }
+    };
+    let (ci, oi) = (inside_corner(edges[s]), inside_corner(opposite(s)));
+    if (ci.index() ^ oi.index()).count_ones() != 2 {
+        return None;
+    }
+    // Both cells use one vertex for both arcs (a larger cell has one vertex)
+    let double = |i: usize| {
+        cs[i].depth < depth
+            || leafs[i].edge(edges[i]).map(|x| x.vert)
+                == leafs[i].edge(opposite(i)).map(|x| x.vert)
+    };
+    if !double(j) || !double(n) {
+        return None;
+    }
+
+    // The arc around the inside corner `ci`: from this edge to the edge from
+    // `ci` across the face
+    let (a, b) = edges[s].corners();
+    let t = a.index() ^ b.index();
+    let w = (ci.index() ^ oi.index()) & !t;
+    let other = (0..12).map(Edge::new).find(|e| {
+        let (x, y) = e.corners();
+        [x.index(), y.index()] == [ci.index(), ci.index() ^ w]
+            || [y.index(), x.index()] == [ci.index(), ci.index() ^ w]
+    })?;
+    let p = leafs[s].index + leafs[s].edge(edges[s])?.edge.0 as usize;
+    let q = leafs[s].index + leafs[s].edge(other)?.edge.0 as usize;
+    let c0 = cs[s].corner(ci);
+    let c1 = cs[s].corner(Corner::new((ci.index() ^ t ^ w) as u8));
+    let key = [
+        c0[0].to_bits(),
+        c0[1].to_bits(),
+        c0[2].to_bits(),
+        c1[0].to_bits(),
+        c1[1].to_bits(),
+        c1[2].to_bits(),
+    ];
+    Some((key, p, q))
+}
+
 /// Triangulates the polygon around one edge (cell vertices `ring`, in order,
 /// and the edge's intersection vertex `center`; indices into the octree's
 /// vertices)
@@ -233,8 +341,11 @@ pub fn dc_edge<T: Frame>(
 /// octree's cells differ in size, a larger cell's vertex can sit so that the
 /// fan folds over: some of its triangles face against the surface.  Then the
 /// ring is split by one of its diagonals instead (or is a single triangle),
-/// whichever folds the least area; the edges shared with the neighbouring
-/// polygons don't change, so the mesh stays watertight.
+/// whichever folds the least area.  The same happens where the fan has a
+/// triangle with no area: where the surface runs exactly through a cell's edge
+/// or corner, the intersection vertex can land on a cell vertex (or in line
+/// with two).  The edges shared with the neighbouring polygons don't change,
+/// so the mesh stays watertight.
 fn triangulate(
     octree: &Octree,
     ring: &[usize],
@@ -247,8 +358,11 @@ fn triangulate(
     if n < 3 {
         return fan;
     }
-    // Area that faces against the field's normals at the corners (0 if none)
-    let folded = |tris: &[[usize; 3]]| -> f32 {
+    // Score: triangles with no area (a vertex on another, or three in a
+    // line: they happen where the surface runs exactly through a cell's edge
+    // or corner), then area that faces against the field's normals at the
+    // corners. The fan is kept when it scores (0, 0).
+    let score = |tris: &[[usize; 3]]| -> (usize, f32) {
         tris.iter()
             .map(|&[a, b, c]| {
                 let (pa, pb, pc) = (
@@ -256,15 +370,21 @@ fn triangulate(
                     octree.verts[b].pos,
                     octree.verts[c].pos,
                 );
+                let x = (pb - pa).cross(&(pc - pa));
+                let longest = (pb - pa)
+                    .norm_squared()
+                    .max((pc - pb).norm_squared())
+                    .max((pa - pc).norm_squared());
+                let flat = x.norm() <= 1e-4 * longest;
                 let r =
                     octree.normals[a] + octree.normals[b] + octree.normals[c];
                 let r = r.try_normalize(1e-6).unwrap_or_default();
-                (-(pb - pa).cross(&(pc - pa)).dot(&r)).max(0.0)
+                (flat as usize, (-x.dot(&r)).max(0.0))
             })
-            .sum()
+            .fold((0, 0.0), |(n, f), (m, g)| (n + m, f + g))
     };
-    let mut best = folded(&fan);
-    if best == 0.0 {
+    let mut best = score(&fan);
+    if best == (0, 0.0) {
         return fan;
     }
     let mut out = fan;
@@ -285,8 +405,8 @@ fn triangulate(
             .collect()
     };
     for tris in splits {
-        let f = folded(&tris);
-        if f < best {
+        let f = score(&tris);
+        if f.0 < best.0 || (f.0 == best.0 && f.1 < best.1) {
             best = f;
             out = tris;
         }

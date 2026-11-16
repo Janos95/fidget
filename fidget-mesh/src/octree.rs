@@ -473,9 +473,12 @@ impl Octree {
         debug_assert_ne!(mask, 255);
         debug_assert_ne!(mask, 0);
 
-        // TODO: this check may not be necessary, because we're doing *manifold*
-        // dual contouring; the collapsed cell can have multiple vertices.
-        if CELL_TO_VERT_TO_EDGES[mask as usize].len() == 1 {
+        // The merged cell gets one vertex, so it must have one vertex's worth
+        // of surface: a single disc (§3.2 of Schaefer, Ju and Warren's
+        // "Manifold Dual Contouring", 2007).  The signs above don't see
+        // everything inside: a tube through the cell, or two sheets meeting at
+        // one corner, would pinch the mesh at the merged vertex.
+        if CELL_TO_VERT_TO_EDGES[mask as usize].len() == 1 && is_disc(&cells) {
             Some(CellMask::new(mask))
         } else {
             None
@@ -670,6 +673,19 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
             .filter(|(_i, v)| **v < 0.0)
             .fold(0, |acc, (i, _v)| acc | (1 << i));
 
+        // How fast the field changes across the cell: a gradient far below
+        // this is no gradient (see `flat` below)
+        let slope = {
+            let (lo, hi) = out
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
+                    (lo.min(v), hi.max(v))
+                });
+            (hi - lo)
+                / (cell.corner(Corner::new(7))[0]
+                    - cell.corner(Corner::new(0))[0])
+        };
+
         // Early exit if the cell is completely empty or full
         if mask == 0 {
             return Cell::Empty;
@@ -735,6 +751,10 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
             &mut [0.0; 12 * EDGE_SEARCH_SIZE][..edge_count * EDGE_SEARCH_SIZE];
         let zs =
             &mut [0.0; 12 * EDGE_SEARCH_SIZE][..edge_count * EDGE_SEARCH_SIZE];
+
+        // The inside corner of each edge, kept for gradients below
+        let inside: arrayvec::ArrayVec<nalgebra::Vector3<u16>, 12> =
+            start.iter().cloned().collect();
 
         // This part looks hairy, but it's just doing an N-ary search along each
         // edge to find the intersection point.
@@ -854,16 +874,20 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
 
         // An exact distance field can have no gradient exactly on its surface
         // (e.g. the derivative of `sqrt(x² + y²)` where both are zero, the
-        // outside of a box); where the search lands there, which it does on
-        // faces aligned with the grid, the intersection would add no plane to
-        // the QEF and the vertex would slide off a sharp edge.  Take the
-        // gradient from the search's last point inside instead: the value is
-        // nonzero there.
+        // outside of a box); where the search lands there, the intersection
+        // would add no plane to the QEF and the vertex would slide off a sharp
+        // edge, or two cells' vertices would land on one point.  It does land
+        // there on faces aligned with the grid, and far from the origin, where
+        // the search's last steps round to the same coordinates (and the
+        // gradient there is rounding noise: a thousandth of the field's slope
+        // across the cell counts as none).  Take the gradient a 64th of the
+        // cell inside along the edge instead.
         let flat: arrayvec::ArrayVec<usize, 12> = (0..grads.len())
             .filter(|&i| {
                 let g = grads[i];
                 [g.dx, g.dy, g.dz].iter().all(|f| f.is_finite())
-                    && g.dx.abs().max(g.dy.abs()).max(g.dz.abs()) <= 1e-12
+                    && g.dx.abs().max(g.dy.abs()).max(g.dz.abs())
+                        <= 1e-3 * slope
             })
             .collect();
         if !flat.is_empty() {
@@ -871,7 +895,10 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
             let mut fy = [Grad::from(0.0); 12];
             let mut fz = [Grad::from(0.0); 12];
             for (k, &i) in flat.iter().enumerate() {
-                let pos = cell.pos(start[i]);
+                let p = start[i].map(|v| v as i32);
+                let q = inside[i].map(|v| v as i32);
+                let step = (q - p).map(|d| d.clamp(-1024, 1024));
+                let pos = cell.pos((p + step).map(|v| v as u16));
                 fx[k] = Grad::new(pos.x, 1.0, 0.0, 0.0);
                 fy[k] = Grad::new(pos.y, 0.0, 1.0, 0.0);
                 fz[k] = Grad::new(pos.z, 0.0, 0.0, 1.0);
@@ -963,6 +990,92 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+/// Whether the surface inside eight sibling cells (each with at most one
+/// vertex) is one disc
+///
+/// The siblings' corners form a 3×3×3 grid of signs.  The surface cuts that
+/// grid's edges at points, its faces along arcs and its cells in discs (one
+/// per cell with a vertex), so its Euler characteristic is points - arcs +
+/// discs; a connected surface with a boundary is a disc iff that is 1.
+fn is_disc(cells: &[Cell<3>; 8]) -> bool {
+    // Sign at grid point (x, y, z), each 0..=2
+    let inside = |x: usize, y: usize, z: usize| -> bool {
+        let (cx, cy, cz) = (x.min(1), y.min(1), z.min(1));
+        let child = cx | (cy << 1) | (cz << 2);
+        let corner = (x - cx) | ((y - cy) << 1) | ((z - cz) << 2);
+        cells[child].corner(Corner::new(corner as u8))
+    };
+    let mut points = 0;
+    for axis in 0..3 {
+        for a in 0..2 {
+            for b in 0..3 {
+                for c in 0..3 {
+                    let p = |t: usize| match axis {
+                        0 => inside(t, b, c),
+                        1 => inside(c, t, b),
+                        _ => inside(b, c, t),
+                    };
+                    points += (p(a) != p(a + 1)) as i32;
+                }
+            }
+        }
+    }
+    // Faces: a square with corners at (u, v) .. (u + 1, v + 1) in the plane
+    // normal to `axis` at `w`; it has one arc per two crossings.  Faces
+    // inside the 2×2×2 block (w == 1) also join the discs on either side.
+    let mut arcs = 0;
+    let mut parent = [0, 1, 2, 3, 4, 5, 6, 7];
+    fn find(p: &mut [usize; 8], i: usize) -> usize {
+        let mut i = i;
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    for axis in 0..3 {
+        for w in 0..3 {
+            for u in 0..2 {
+                for v in 0..2 {
+                    let at = |du: usize, dv: usize| match axis {
+                        0 => inside(w, u + du, v + dv),
+                        1 => inside(v + dv, w, u + du),
+                        _ => inside(u + du, v + dv, w),
+                    };
+                    let ring = [at(0, 0), at(1, 0), at(1, 1), at(0, 1)];
+                    let crossings = (0..4)
+                        .filter(|&k| ring[k] != ring[(k + 1) % 4])
+                        .count();
+                    arcs += crossings as i32 / 2;
+                    if w == 1 && crossings > 0 {
+                        let cell = |side: usize| -> usize {
+                            let (x, y, z) = match axis {
+                                0 => (side, u, v),
+                                1 => (v, side, u),
+                                _ => (u, v, side),
+                            };
+                            x | (y << 1) | (z << 2)
+                        };
+                        let (a, b) = (
+                            find(&mut parent, cell(0)),
+                            find(&mut parent, cell(1)),
+                        );
+                        parent[a] = b;
+                    }
+                }
+            }
+        }
+    }
+    let with_vertex: Vec<usize> = (0..8)
+        .filter(|&i| matches!(cells[i], Cell::Leaf(..)))
+        .collect();
+    let discs = with_vertex.len() as i32;
+    let connected = with_vertex
+        .iter()
+        .all(|&i| find(&mut parent, i) == find(&mut parent, with_vertex[0]));
+    connected && points - arcs + discs == 1
+}
 
 /// Whether a gradient gives a direction
 fn usable(g: nalgebra::Vector3<f32>) -> bool {
@@ -1488,6 +1601,145 @@ mod test {
                 "{:.3}% of the area folds",
                 100.0 * folded / total
             );
+        }
+    }
+
+    #[test]
+    fn test_no_zero_area_where_the_surface_grazes_a_corner() {
+        // The corner at the origin is inside by less than one step of the edge
+        // search, so the cell above it has a cap too small to see: its vertex
+        // and three intersections all land on the corner, and fanning around
+        // those edges would make triangles with no area
+        let (x, y, z) = Tree::axes();
+        let ball =
+            (x.clone().square() + y.clone().square() + z.clone().square())
+                .sqrt()
+                - 0.9;
+        let shape = tree_to_shape((x + y + z - 1e-7).max(ball));
+        for depth in [4, 5, 6] {
+            let settings = Settings {
+                depth,
+                threads: None,
+                ..Default::default()
+            };
+            let mesh = Octree::build(&shape, &settings).unwrap().walk_dual();
+            check_for_edge_matching(&mesh).unwrap();
+            check_for_manifold_vertices(&mesh).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_two_caps_are_two_vertices() {
+        // Six inside corners around two opposite outside ones (0 and 7): one
+        // inside region, but the surface is two caps, one around each outside
+        // corner, and one vertex for both would pinch the mesh
+        assert_eq!(CELL_TO_VERT_TO_EDGES[0b0111_1110].len(), 2);
+        assert_eq!(CELL_TO_VERT_TO_EDGES[0b1000_0001].len(), 2);
+    }
+
+    /// A union of capsules (rods with round ends) at pseudo-random places,
+    /// thin enough that the cells see their crossings, tangencies and gaps
+    fn rods(seed: u64, count: usize) -> Tree {
+        let mut state =
+            seed.wrapping_mul(6364136223846793005) ^ 0x9e3779b97f4a7c15;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64 / (1u64 << 31) as f64) as f32
+        };
+        let (x, y, z) = Tree::axes();
+        let mut out: Option<Tree> = None;
+        for _ in 0..count {
+            let a = [0; 3].map(|_| 1.6 * next() - 0.8);
+            let b = [0; 3].map(|_| 1.6 * next() - 0.8);
+            let r = 0.03 + 0.09 * next();
+            let ba = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let len2 = ba[0] * ba[0] + ba[1] * ba[1] + ba[2] * ba[2];
+            let pa = [x.clone() - a[0], y.clone() - a[1], z.clone() - a[2]];
+            let h = ((pa[0].clone() * ba[0]
+                + pa[1].clone() * ba[1]
+                + pa[2].clone() * ba[2])
+                / len2)
+                .max(0.0)
+                .min(1.0);
+            let d = ((pa[0].clone() - h.clone() * ba[0]).square()
+                + (pa[1].clone() - h.clone() * ba[1]).square()
+                + (pa[2].clone() - h * ba[2]).square())
+            .sqrt()
+                - r;
+            out = Some(match out {
+                None => d,
+                Some(o) => o.min(d),
+            });
+        }
+        out.unwrap()
+    }
+
+    /// Checks that every vertex's triangles form one fan (its link is a
+    /// single cycle: no pinch), and that no triangle has zero area
+    fn check_for_manifold_vertices(mesh: &Mesh) -> Result<(), String> {
+        let mut next: Vec<BTreeMap<usize, usize>> =
+            vec![BTreeMap::new(); mesh.vertices.len()];
+        for t in &mesh.triangles {
+            let [a, b, c] = [t.x, t.y, t.z];
+            for (v, p, q) in [(a, b, c), (b, c, a), (c, a, b)] {
+                if next[v].insert(p, q).is_some() {
+                    return Err(format!("vertex {v} repeats a triangle edge"));
+                }
+            }
+            let [pa, pb, pc] = [a, b, c].map(|i| mesh.vertices[i]);
+            if (pb - pa).cross(&(pc - pa)).norm() == 0.0 {
+                return Err(format!("zero-area triangle at {pa:?}"));
+            }
+        }
+        for (v, link) in next.iter().enumerate() {
+            let Some((&start, _)) = link.iter().next() else {
+                continue;
+            };
+            let (mut cur, mut steps) = (start, 0);
+            loop {
+                cur = *link
+                    .get(&cur)
+                    .ok_or_else(|| format!("open fan at vertex {v}"))?;
+                steps += 1;
+                if cur == start {
+                    break;
+                }
+            }
+            if steps != link.len() {
+                return Err(format!(
+                    "pinched vertex {v} at {:?}",
+                    mesh.vertices[v]
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_meshes_are_closed_manifolds() {
+        // Thin rods cross, touch and nearly touch: cells with two patches
+        // (rods 13 at depth 5), ambiguous faces whose arcs both cells join (a
+        // tunnel through the face; also rods 13), and merged cells whose
+        // surface isn't one disc
+        // (six rods, seed 1: a merged cell around a tube at depth 6)
+        for (seed, count) in (0..40).map(|s| (s, 4)).chain([(1, 6)]) {
+            let shape = tree_to_shape(rods(seed, count));
+            for depth in [5, 6, 7] {
+                let settings = Settings {
+                    depth,
+                    threads: None,
+                    ..Default::default()
+                };
+                let mesh =
+                    Octree::build(&shape, &settings).unwrap().walk_dual();
+                let ok = check_for_edge_matching(&mesh)
+                    .and_then(|_| check_for_manifold_vertices(&mesh));
+                if let Err(e) = ok {
+                    panic!("rods {seed} at depth {depth}: {e}");
+                }
+            }
         }
     }
 

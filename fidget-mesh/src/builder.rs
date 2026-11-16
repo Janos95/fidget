@@ -9,6 +9,10 @@ pub struct MeshBuilder {
     ///
     /// `usize::MAX` is used a marker for an unmapped vertex
     map: Vec<usize>,
+    /// Vertices added on ambiguous faces ([`dc::dc_edge`]), by the positions
+    /// of the inside corner that their arc cuts off and of the face's corner
+    /// diagonal from it
+    arcs: std::collections::HashMap<[u32; 6], usize>,
     out: Mesh,
 }
 
@@ -53,6 +57,20 @@ impl MeshBuilder {
     /// vertex (i.e. the one on the edge) always last.
     pub(crate) fn triangle(&mut self, a: usize, b: usize, c: usize) {
         self.out.triangles.push(nalgebra::Vector3::new(a, b, c))
+    }
+
+    /// Looks up (or adds) the vertex for an arc of surface across a face
+    pub(crate) fn arc_vertex(
+        &mut self,
+        key: [u32; 6],
+        pos: impl FnOnce() -> (nalgebra::Vector3<f32>, nalgebra::Vector3<f32>),
+    ) -> usize {
+        *self.arcs.entry(key).or_insert_with(|| {
+            let (p, n) = pos();
+            self.out.vertices.push(p);
+            self.out.normals.push(n);
+            self.out.vertices.len() - 1
+        })
     }
 
     /// Looks up the given vertex, localizing it within a cell

@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Write,
-};
+use std::{collections::BTreeMap, io::Write};
 
 // Same axes as in `fidget_mesh`, but available at build time.
 const X: usize = 1;
@@ -17,6 +14,98 @@ fn next(axis: usize) -> usize {
     assert!(out < 8);
 
     out
+}
+
+/// Corners of a cube face: the face normal to `axis` (`X`, `Y` or `Z`), on the
+/// low (`side == 0`) or high side
+fn face_corners(axis: usize, side: usize) -> [usize; 4] {
+    let u = next(axis);
+    let v = next(u);
+    let a = axis * side;
+    [a, a | u, a | u | v, a | v]
+}
+
+/// The two inside corners of face `f` (`axis = 1 << (f / 2)`, `side = f % 2`)
+/// if they're diagonal from each other and the other two are outside: the
+/// face is ambiguous, with two arcs of surface crossing it
+fn ambiguous(mask: usize, f: usize) -> Option<(usize, usize)> {
+    let c = face_corners(1 << (f / 2), f % 2);
+    let inside = |k: usize| mask & (1 << c[k]) != 0;
+    match (inside(0), inside(1), inside(2), inside(3)) {
+        (true, false, true, false) => Some((c[0], c[2])),
+        (false, true, false, true) => Some((c[1], c[3])),
+        _ => None,
+    }
+}
+
+/// Groups a cell's crossing edges (`(inside corner, outside corner)`) into
+/// vertices, one per patch of surface.
+///
+/// A patch is where one connected inside region meets one connected outside
+/// region.  Corners connect along the cube's edges, and an ambiguous face's
+/// outside corners also connect across its diagonal: its two arcs of surface
+/// cut off the inside corners.  Both cells on a face decide this from the
+/// face's corners alone, so they agree on the arcs that cross it.  (A filled
+/// region can meet the outside in several patches: six inside corners around
+/// two opposite outside ones make two caps, and one vertex for both would
+/// pinch the mesh.)
+fn patches(mask: usize) -> Vec<Vec<(usize, usize)>> {
+    let mut parent = [0, 1, 2, 3, 4, 5, 6, 7];
+    fn find(p: &mut [usize; 8], i: usize) -> usize {
+        let mut i = i;
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    let inside = |c: usize| mask & (1 << c) != 0;
+    let join = |p: &mut [usize; 8], a: usize, b: usize| {
+        let (a, b) = (find(p, a), find(p, b));
+        p[a] = b;
+    };
+    for a in 0..8 {
+        for t in [X, Y, Z] {
+            let b = a | t;
+            if b != a && inside(a) == inside(b) {
+                join(&mut parent, a, b);
+            }
+        }
+    }
+    for f in 0..6 {
+        if ambiguous(mask, f).is_some() {
+            let o = face_corners(1 << (f / 2), f % 2)
+                .into_iter()
+                .filter(|&k| !inside(k))
+                .collect::<Vec<_>>();
+            join(&mut parent, o[0], o[1]);
+        }
+    }
+
+    let mut verts: BTreeMap<(usize, usize), Vec<(usize, usize)>> =
+        BTreeMap::new();
+    for rev in [false, true] {
+        // t-u-v forms a right-handed coordinate system
+        for t in [X, Y, Z] {
+            let u = next(t);
+            let v = next(u);
+            for b in 0..2 {
+                for a in 0..2 {
+                    let start = (a * u) | (b * v);
+                    let end = start | t;
+                    let (start, end) =
+                        if rev { (end, start) } else { (start, end) };
+                    // Only edges from inside (`start`) to outside (`end`)
+                    if inside(start) && !inside(end) {
+                        let key =
+                            (find(&mut parent, start), find(&mut parent, end));
+                        verts.entry(key).or_default().push((start, end));
+                    }
+                }
+            }
+        }
+    }
+    verts.into_values().collect()
 }
 
 /// Builds a table for Manifold Dual Contouring connectivity.
@@ -35,96 +124,7 @@ fn main() -> Result<(), std::io::Error> {
     let mut edge_table = vec![];
 
     for i in 0..256 {
-        let mut filled_regions = BTreeMap::new();
-        let mut empty_regions = BTreeMap::new();
-        for j in 0..8 {
-            if (i & (1 << j)) == 0 {
-                empty_regions.insert(j, 1 << j);
-            } else {
-                filled_regions.insert(j, 1 << j);
-            }
-        }
-        // Collapse connected cells in both filled and empty regions
-        for r in [&mut filled_regions, &mut empty_regions] {
-            loop {
-                let mut changed = false;
-                let mut next = r.clone();
-                for f in r.keys() {
-                    for axis in [X, Y, Z] {
-                        let g = &(f ^ axis);
-                        if r.contains_key(g) {
-                            let v = next[f] | next[g];
-                            changed |= (next[f] != v) | (next[g] != v);
-
-                            *next.get_mut(f).unwrap() = v;
-                            *next.get_mut(g).unwrap() = v;
-                        }
-                    }
-                }
-                *r = next;
-                if !changed {
-                    break;
-                }
-            }
-        }
-        // At this point, {filled,empty}_regions are maps from a vertex
-        // number (0-7) to a mask of the region containing that vertex.
-        //
-        // We can discard the vertex numbers and just store the region masks
-        // before processing them further
-        let filled_regions: BTreeSet<u8> =
-            filled_regions.into_values().collect();
-        let empty_regions: BTreeSet<u8> = empty_regions.into_values().collect();
-
-        // Now, we can flatten into a map from vertex (0-7) to an abstract
-        // region number (0-), since that's what actually matters when
-        // grouping transitions.
-        let mut regions = [u8::MAX; 8];
-        for (i, r) in
-            filled_regions.into_iter().chain(empty_regions).enumerate()
-        {
-            for (j, region) in regions.iter_mut().enumerate() {
-                if r & (1 << j) != 0 {
-                    assert_eq!(*region, u8::MAX);
-                    *region = i as u8;
-                }
-            }
-        }
-
-        // We're finally ready to build the edge transition table!
-        //
-        // vert_map is a map from start region to a vertex, defined as a list
-        // of edges that built that vertex.
-        let mut verts: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        for rev in [false, true] {
-            // t-u-v forms a right-handed coordinate system
-            for t in [X, Y, Z] {
-                let u = next(t);
-                let v = next(u);
-                for b in 0..2 {
-                    for a in 0..2 {
-                        let start = (a * u) | (b * v);
-                        let end = start | t;
-
-                        let (start, end) =
-                            if rev { (end, start) } else { (start, end) };
-
-                        // Only process this edge if `start` is inside the model
-                        // (non-zero) and `end` is outside (0).
-                        if ((i & (1 << start)) != 0) && ((i & (1 << end)) == 0)
-                        {
-                            let start_region = regions[start];
-                            let end_region = regions[end];
-                            assert!(start_region != end_region);
-                            verts
-                                .entry(start_region)
-                                .or_default()
-                                .push((start, end));
-                        }
-                    }
-                }
-            }
-        }
+        let verts = patches(i);
 
         let mut vert_table_entry = vec![];
 
@@ -135,7 +135,7 @@ fn main() -> Result<(), std::io::Error> {
         let mut intersection_count = 0;
         let vert_count = verts.len();
         #[allow(clippy::identity_op)]
-        for (vert, (_, edges)) in verts.iter().enumerate() {
+        for (vert, edges) in verts.iter().enumerate() {
             let mut vert_entry = vec![];
 
             for &(start, end) in edges {
