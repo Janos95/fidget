@@ -849,6 +849,52 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
                 | ShapeBulkEvalError::MismatchedVarSlices { .. },
             ) => unreachable!(),
         };
+        let mut grads: arrayvec::ArrayVec<Grad, 12> =
+            grads.iter().cloned().collect();
+
+        // An exact distance field can have no gradient exactly on its surface
+        // (e.g. the derivative of `sqrt(x² + y²)` where both are zero, the
+        // outside of a box); where the search lands there, which it does on
+        // faces aligned with the grid, the intersection would add no plane to
+        // the QEF and the vertex would slide off a sharp edge.  Take the
+        // gradient from the search's last point inside instead: the value is
+        // nonzero there.
+        let flat: arrayvec::ArrayVec<usize, 12> = (0..grads.len())
+            .filter(|&i| {
+                let g = grads[i];
+                [g.dx, g.dy, g.dz].iter().all(|f| f.is_finite())
+                    && g.dx.abs().max(g.dy.abs()).max(g.dz.abs()) <= 1e-12
+            })
+            .collect();
+        if !flat.is_empty() {
+            let mut fx = [Grad::from(0.0); 12];
+            let mut fy = [Grad::from(0.0); 12];
+            let mut fz = [Grad::from(0.0); 12];
+            for (k, &i) in flat.iter().enumerate() {
+                let pos = cell.pos(start[i]);
+                fx[k] = Grad::new(pos.x, 1.0, 0.0, 0.0);
+                fy[k] = Grad::new(pos.y, 0.0, 1.0, 0.0);
+                fz[k] = Grad::new(pos.z, 0.0, 0.0, 1.0);
+            }
+            let n = flat.len();
+            let inside = match self.eval_grad_slice.eval_raw(
+                eval.g_tape(&mut self.tape_storage),
+                &fx[..n],
+                &fy[..n],
+                &fz[..n],
+                self.world_to_model,
+                ShapeBulkEval::<F::GradSliceEval>::var_value(self.vars),
+            ) {
+                Ok(v) => v,
+                Err(
+                    ShapeBulkEvalError::MissingVar(..)
+                    | ShapeBulkEvalError::MismatchedVarSlices { .. },
+                ) => unreachable!(),
+            };
+            for (&i, g) in flat.iter().zip(inside) {
+                grads[i] = Grad::new(grads[i].v, g.dx, g.dy, g.dz);
+            }
+        }
 
         let mut verts: arrayvec::ArrayVec<_, 4> = arrayvec::ArrayVec::new();
         let mut i = 0;
@@ -1442,6 +1488,49 @@ mod test {
                 "{:.3}% of the area folds",
                 100.0 * folded / total
             );
+        }
+    }
+
+    #[test]
+    fn test_exact_box_keeps_its_edges() {
+        // An exact distance (`length(max(q, 0)) + min(max(q), 0)`) has no
+        // gradient on its faces' grid-aligned points; the vertices of merged
+        // cells must still land on the box's edges, not slide off them
+        let (x, y, z) = Tree::axes();
+        let qx = (x - 0.125).abs() - 0.5;
+        let qy = (y + 0.0625).abs() - 0.375;
+        let qz = z.abs() - 0.25;
+        let outside = (qx.clone().max(0.0).square()
+            + qy.clone().max(0.0).square()
+            + qz.clone().max(0.0).square())
+        .sqrt();
+        let inside = qx.max(qy).max(qz).min(0.0);
+        let shape = tree_to_shape(outside + inside);
+        for threads in [None, Some(&ThreadPool::Global)] {
+            let settings = Settings {
+                depth: 6,
+                threads,
+                ..Default::default()
+            };
+            let mesh = Octree::build(&shape, &settings).unwrap().walk_dual();
+            let mut volume = 0.0;
+            for t in &mesh.triangles {
+                let [a, b, c] = [t.x, t.y, t.z].map(|i| mesh.vertices[i]);
+                volume += a.dot(&b.cross(&c)) / 6.0;
+            }
+            let expected = 1.0 * 0.75 * 0.5;
+            assert!(
+                (volume.abs() - expected).abs() < 1e-4,
+                "volume {volume} for {expected}"
+            );
+            for p in &mesh.vertices {
+                let d = nalgebra::Vector3::new(
+                    (p.x - 0.125).abs() - 0.5,
+                    (p.y + 0.0625).abs() - 0.375,
+                    p.z.abs() - 0.25,
+                );
+                assert!(d.max().abs() < 1e-4, "vertex {p:?} is off the box");
+            }
         }
     }
 
