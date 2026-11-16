@@ -99,6 +99,17 @@ pub struct Settings<'a> {
 
     /// Token to cancel rendering
     pub cancel: CancelToken,
+
+    /// How far (in model units) a merged cell's vertex may be from the
+    /// surface for the octree to collapse it
+    ///
+    /// Eight cells merge into one when the sum of the squared distances from
+    /// the new vertex to the planes of all their intersections is at most
+    /// `max_err²`: the same tolerance in model units however large the octree
+    /// is.  `None` keeps the relative rule (merge while the error at most
+    /// doubles, with the error clamped at 1e-6 in the octree's [-1, 1] frame),
+    /// whose tolerance in model units grows with the octree's size.
+    pub max_err: Option<f32>,
 }
 
 impl Default for Settings<'_> {
@@ -108,6 +119,7 @@ impl Default for Settings<'_> {
             world_to_model: nalgebra::Matrix4::identity(),
             threads: Some(&ThreadPool::Global),
             cancel: CancelToken::new(),
+            max_err: None,
         }
     }
 }

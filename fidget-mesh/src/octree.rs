@@ -38,6 +38,11 @@ pub struct Octree {
     /// octree's frame (NaN where not known yet); [`Octree::build`] turns them
     /// into unit normals in model space, zero where the field has no direction.
     pub(crate) normals: Vec<nalgebra::Vector3<f32>>,
+
+    /// Absolute collapse tolerance: the largest QEF error (sum of squared
+    /// distances to the planes, in the octree's frame) a merged cell may
+    /// have, from [`Settings::max_err`]; `None` for the relative rule
+    pub(crate) max_err: Option<f64>,
 }
 
 impl Octree {
@@ -48,6 +53,25 @@ impl Octree {
             cells: vec![],
             verts: vec![],
             normals: vec![],
+            max_err: None,
+        }
+    }
+
+    /// An empty octree that collapses cells as `settings` say
+    pub(crate) fn for_settings(settings: &Settings) -> Self {
+        Octree {
+            max_err: settings.max_err.map(|tol| {
+                // the octree's [-1, 1] frame is scaled by the transform's
+                // largest axis to model space
+                let m = settings.world_to_model.fixed_view::<3, 3>(0, 0);
+                let scale = m
+                    .column(0)
+                    .norm()
+                    .max(m.column(1).norm())
+                    .max(m.column(2).norm());
+                (f64::from(tol) / f64::from(scale)).powi(2)
+            }),
+            ..Self::new()
         }
     }
 
@@ -136,7 +160,7 @@ impl Octree {
         vars: &ShapeVars<f32>,
         threads: &ThreadPool,
     ) -> Option<Self> {
-        let mut root = Octree::new();
+        let mut root = Octree::for_settings(settings);
         let mut todo = VecDeque::new();
         todo.push_back(CellIndex::<3>::default());
         let mut fixup = vec![];
@@ -186,7 +210,7 @@ impl Octree {
                         }
                         let octree = std::mem::replace(
                             &mut builder.octree,
-                            Octree::new(),
+                            Octree::for_settings(settings),
                         );
                         Some(Output {
                             octree,
@@ -373,7 +397,13 @@ impl Octree {
         // - The interior vertices *do not* match, in which case the
         //   cell should not be marked as collapsible.
         let (pos, new_err) = hermite.solve();
-        if new_err >= hermite.qef_err * 2.0 || !cell.bounds.contains(pos) {
+        let reject = match self.max_err {
+            // an absolute tolerance: the same in model units whatever the
+            // octree's size (the relative rule's error floor scales with it)
+            Some(max_err) => hermite.solve_exact().1 > max_err,
+            None => new_err >= hermite.qef_err * 2.0,
+        };
+        if reject || !cell.bounds.contains(pos) {
             return None;
         }
         // Record the newly-collapsed leaf
@@ -539,7 +569,7 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
                 Some(&settings.world_to_model)
             };
         Self {
-            octree: Octree::new(),
+            octree: Octree::for_settings(settings),
 
             cancel: settings.cancel.clone(),
             max_depth: settings.depth,
@@ -1261,7 +1291,7 @@ impl LeafHermiteData {
         // Accumulate face QEFs along edges
         for t in [X, Y, Z] {
             let u = t.next();
-            let v = t.next();
+            let v = u.next();
             for face in 0..2 {
                 let a = if face == 1 {
                     t.into()
@@ -1275,26 +1305,29 @@ impl LeafHermiteData {
                 for q in [a, b, c, d] {
                     out.face_qefs[f] += leafs[q.index()].face_qefs[f];
                 }
-                // Edges oriented along the v axis on this face
-                let edge_index_v = v.index() * 4 + face * 2 + 1;
+                // The face's inner edges: along u at v = mid (halves in
+                // children a and b; an edge along u is indexed by its offsets
+                // along v then t) ...
+                let along_u = u.index() * 4 + 1 + face * 2;
                 out.face_qefs[f] +=
-                    leafs[a.index()].intersections[edge_index_v].into();
+                    leafs[a.index()].intersections[along_u].into();
                 out.face_qefs[f] +=
-                    leafs[b.index()].intersections[edge_index_v].into();
+                    leafs[b.index()].intersections[along_u].into();
 
-                // Edges oriented along the u axis on this face
-                let edge_index_u = v.index() * 4 + face * 2 + 1;
+                // ... and along v at u = mid (halves in children a and c; an
+                // edge along v is indexed by its offsets along t then u)
+                let along_v = v.index() * 4 + face + 2;
                 out.face_qefs[f] +=
-                    leafs[a.index()].intersections[edge_index_u].into();
+                    leafs[a.index()].intersections[along_v].into();
                 out.face_qefs[f] +=
-                    leafs[c.index()].intersections[edge_index_u].into();
+                    leafs[c.index()].intersections[along_v].into();
             }
         }
 
         // Accumulate center QEFs
         for t in [X, Y, Z] {
             let u = t.next();
-            let v = t.next();
+            let v = u.next();
 
             // Accumulate the four inner face QEFs
             let a = Corner::<3>::new(0);
@@ -1327,8 +1360,8 @@ impl LeafHermiteData {
         Some(out)
     }
 
-    /// Solves the combined QEF
-    pub fn solve(&self) -> (CellVertex<3>, f32) {
+    /// The combined QEF
+    fn qef(&self) -> QuadraticErrorSolver {
         let mut qef = self.center_qef;
         for &i in &self.intersections {
             qef += i.into();
@@ -1336,7 +1369,17 @@ impl LeafHermiteData {
         for &f in &self.face_qefs {
             qef += f;
         }
-        qef.solve()
+        qef
+    }
+
+    /// Solves the combined QEF
+    pub fn solve(&self) -> (CellVertex<3>, f32) {
+        self.qef().solve()
+    }
+
+    /// Solves the combined QEF, with the error unclamped
+    pub fn solve_exact(&self) -> (CellVertex<3>, f64) {
+        self.qef().solve_exact()
     }
 }
 
@@ -1492,6 +1535,7 @@ mod test {
         let sphere_mesh = octree.walk_dual();
 
         let mut edge_count = 0;
+        let mut corner_count = 0;
         for v in &sphere_mesh.vertices {
             // Edge vertices should be found via binary search and therefore
             // should be close to the true crossing point
@@ -1515,9 +1559,14 @@ mod test {
                         < 2.0 / 65535.0,
                     "cell vertex {v:?} is not at expected position"
                 );
+                corner_count += 1;
             }
         }
-        assert_eq!(edge_count, 6);
+        // Each quad around an edge is flat (a face of the box), so it is split
+        // by a diagonal and the edge vertices aren't used: a box of 12 triangles
+        assert_eq!(edge_count, 0);
+        assert_eq!(corner_count, 8);
+        assert_eq!(sphere_mesh.triangles.len(), 12);
     }
 
     #[test]
@@ -2369,5 +2418,139 @@ mod test {
             }
         }
         assert_eq!(fails, 0);
+    }
+
+    /// Merging eight leaves counts each intersection on the parent's inner
+    /// edges, and each child's face QEF, exactly once
+    #[test]
+    fn test_merge_counts_each_sample_once() {
+        // The midpoint of edge `e` of child `c`, in the parent's [0, 1] frame
+        // (an edge along axis t is indexed by its offsets along t + 1, t + 2)
+        let mid = |c: usize, e: usize| -> [f32; 3] {
+            let axis = e / 4;
+            let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+            let mut p = [0.0f32; 3];
+            for (k, p) in p.iter_mut().enumerate() {
+                *p = ((c >> k) & 1) as f32 * 0.5;
+            }
+            p[axis] += 0.25;
+            p[u] += (e & 1) as f32 * 0.5;
+            p[v] += ((e >> 1) & 1) as f32 * 0.5;
+            p
+        };
+        let on_parent_edge = |p: [f32; 3]| {
+            p.iter().filter(|&&x| x == 0.0 || x == 1.0).count() >= 2
+        };
+        let weight = |m: &LeafHermiteData| {
+            m.center_qef.mass_point().w
+                + m.face_qefs.iter().map(|f| f.mass_point().w).sum::<f64>()
+        };
+        let mut segments: Vec<[f32; 3]> = vec![];
+        for c in 0..8 {
+            for e in 0..12 {
+                let p = mid(c, e);
+                if !on_parent_edge(p) && !segments.contains(&p) {
+                    segments.push(p);
+                }
+            }
+        }
+        // 6 faces x 4 half-edges + 6 half-edges through the centre
+        assert_eq!(segments.len(), 30);
+        for s in &segments {
+            let mut leafs = [LeafHermiteData::default(); 8];
+            for (c, leaf) in leafs.iter_mut().enumerate() {
+                for e in 0..12 {
+                    if mid(c, e) == *s {
+                        leaf.intersections[e] = LeafIntersection {
+                            pos: nalgebra::Vector4::new(s[0], s[1], s[2], 1.0),
+                            grad: nalgebra::Vector4::new(1.0, 0.0, 0.0, 0.0),
+                        };
+                    }
+                }
+            }
+            let m = LeafHermiteData::merge(leafs).unwrap();
+            assert_eq!(weight(&m), 1.0, "inner edge segment at {s:?}");
+        }
+        // A child's face QEF (face f = 2 t + side) on the parent's surface
+        // counts once; an inner face is shared by two children (their QEFs
+        // hold the same samples), so the pair counts once
+        let face_weight = |c: usize, f: usize| {
+            let mut leafs = [LeafHermiteData::default(); 8];
+            leafs[c].face_qefs[f].add_intersection(
+                nalgebra::Vector3::zeros(),
+                nalgebra::Vector4::new(1.0, 0.0, 0.0, 0.0),
+            );
+            weight(&LeafHermiteData::merge(leafs).unwrap())
+        };
+        for c in 0..8 {
+            for f in 0..6 {
+                let (t, side) = (f / 2, f % 2);
+                if (c >> t) & 1 == side {
+                    assert_eq!(face_weight(c, f), 1.0, "child {c}, face {f}");
+                } else if side == 1 {
+                    let twin = face_weight(c ^ (1 << t), f ^ 1);
+                    assert_eq!(
+                        face_weight(c, f) + twin,
+                        1.0,
+                        "child {c}, face {f}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Mean and largest |field| at the triangles' centres, over the cell size
+    fn centroid_error(
+        shape: &BoundShape<VmFunction, f32>,
+        mesh: &Mesh,
+    ) -> (f32, f32) {
+        let tape = shape.shape().ez_point_tape();
+        let mut eval = VmShape::new_point_eval();
+        let (mut sum, mut worst) = (0.0f32, 0.0f32);
+        for t in &mesh.triangles {
+            let c =
+                (mesh.vertices[t.x] + mesh.vertices[t.y] + mesh.vertices[t.z])
+                    / 3.0;
+            let v = eval.eval(&tape, c.x, c.y, c.z).unwrap().0.abs();
+            sum += v;
+            worst = worst.max(v);
+        }
+        (sum / mesh.triangles.len() as f32, worst)
+    }
+
+    /// `max_err` is a distance in model units: an octree twice as large (one
+    /// level deeper, same cell size) collapses the same surface to about the
+    /// same mesh, and the mesh stays within the tolerance
+    #[test]
+    fn test_max_err_is_absolute() {
+        let shape = tree_to_shape(tilted_torus());
+        let tol = 0.01;
+        let mesh_at = |half: f32, depth: u8, max_err| {
+            let settings = Settings {
+                depth,
+                threads: None,
+                world_to_model: nalgebra::Matrix4::new_scaling(half),
+                max_err,
+                ..Default::default()
+            };
+            Octree::build(&shape, &settings).unwrap().walk_dual()
+        };
+        let small = mesh_at(1.0, 6, Some(tol));
+        let large = mesh_at(2.0, 7, Some(tol));
+        let (a, b) =
+            (small.triangles.len() as f32, large.triangles.len() as f32);
+        assert!((a / b - 1.0).abs() < 0.1, "{a} vs {b} triangles");
+        for m in [&small, &large] {
+            check_for_vertex_dupes(m).unwrap();
+            check_for_edge_matching(m).unwrap();
+            let (mean, worst) = centroid_error(&shape, m);
+            assert!(mean < tol && worst < 4.0 * tol, "{mean} {worst}");
+        }
+        // A tighter tolerance keeps more triangles; none at all collapses no
+        // surface cell
+        let tight = mesh_at(1.0, 6, Some(tol / 10.0));
+        let none = mesh_at(1.0, 6, Some(0.0));
+        assert!(tight.triangles.len() as f32 > 1.5 * a);
+        assert!(none.triangles.len() >= tight.triangles.len());
     }
 }

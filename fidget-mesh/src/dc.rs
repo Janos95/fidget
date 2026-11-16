@@ -337,15 +337,16 @@ fn arc(
 /// and the edge's intersection vertex `center`; indices into the octree's
 /// vertices)
 ///
-/// The usual triangulation is a fan around the intersection vertex.  Where the
-/// octree's cells differ in size, a larger cell's vertex can sit so that the
-/// fan folds over: some of its triangles face against the surface.  Then the
-/// ring is split by one of its diagonals instead (or is a single triangle),
-/// whichever folds the least area.  The same happens where the fan has a
-/// triangle with no area: where the surface runs exactly through a cell's edge
-/// or corner, the intersection vertex can land on a cell vertex (or in line
-/// with two).  The edges shared with the neighbouring polygons don't change,
-/// so the mesh stays watertight.
+/// The ring is split by one of its diagonals (two triangles for a quad, or the
+/// ring itself when it is a triangle): the split that folds the least, then the
+/// flatter of the two.  A fan around the intersection vertex is used only when
+/// it scores better than that split.  The fan has twice the triangles, and its
+/// centre lies on the surface while the cell vertices sit slightly off it (the
+/// QEF minimum), so fans zig-zag: slivers and facet noise in shading.  The fan
+/// still wins where both splits fold: where the octree's cells differ in size
+/// a larger cell's vertex can sit so that a split faces against the surface.
+/// The edges shared with the neighbouring polygons don't change, so the mesh
+/// stays watertight.
 fn triangulate(
     octree: &Octree,
     ring: &[usize],
@@ -383,11 +384,7 @@ fn triangulate(
             })
             .fold((0, 0.0), |(n, f), (m, g)| (n + m, f + g))
     };
-    let mut best = score(&fan);
-    if best == (0, 0.0) {
-        return fan;
-    }
-    let mut out = fan;
+    let fan_score = score(&fan);
     let splits: arrayvec::ArrayVec<arrayvec::ArrayVec<[usize; 3], 4>, 2> = if n
         == 3
     {
@@ -404,12 +401,56 @@ fn triangulate(
             })
             .collect()
     };
+    // How flat a split is: the cosine between its two triangles' normals
+    let flatness = |tris: &[[usize; 3]]| -> f32 {
+        let ns: arrayvec::ArrayVec<nalgebra::Vector3<f32>, 4> = tris
+            .iter()
+            .map(|&[a, b, c]| {
+                let (pa, pb, pc) = (
+                    octree.verts[a].pos,
+                    octree.verts[b].pos,
+                    octree.verts[c].pos,
+                );
+                (pb - pa)
+                    .cross(&(pc - pa))
+                    .try_normalize(1e-12)
+                    .unwrap_or_default()
+            })
+            .collect();
+        if ns.len() == 2 {
+            ns[0].dot(&ns[1])
+        } else {
+            1.0
+        }
+    };
+    const EPS: f32 = 1e-12;
+    let mut pick: Option<(
+        (usize, f32),
+        f32,
+        arrayvec::ArrayVec<[usize; 3], 4>,
+    )> = None;
     for tris in splits {
-        let f = score(&tris);
-        if f.0 < best.0 || (f.0 == best.0 && f.1 < best.1) {
-            best = f;
-            out = tris;
+        let (sc, fl) = (score(&tris), flatness(&tris));
+        let better = match &pick {
+            None => true,
+            Some((bs, bf, _)) => {
+                sc.0 < bs.0
+                    || (sc.0 == bs.0
+                        && (sc.1 < bs.1 - EPS
+                            || ((sc.1 - bs.1).abs() <= EPS && fl > *bf)))
+            }
+        };
+        if better {
+            pick = Some((sc, fl, tris));
         }
     }
-    out
+    match pick {
+        Some((sc, _, tris))
+            if sc.0 < fan_score.0
+                || (sc.0 == fan_score.0 && sc.1 <= fan_score.1 + EPS) =>
+        {
+            tris
+        }
+        _ => fan,
+    }
 }

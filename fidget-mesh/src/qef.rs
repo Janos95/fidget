@@ -1,19 +1,24 @@
 use super::cell::CellVertex;
 
 /// Solver for a quadratic error function to position a vertex within a cell
+///
+/// Sums are kept in `f64`: the error is a small difference of large terms
+/// (planes far from the origin), and an absolute collapse tolerance
+/// ([`Settings::max_err`](crate::Settings::max_err)) compares it to values far
+/// below what `f32` resolves there.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct QuadraticErrorSolver {
     /// A^T A term
-    ata: nalgebra::Matrix3<f32>,
+    ata: nalgebra::Matrix3<f64>,
 
     /// A^T B term
-    atb: nalgebra::Vector3<f32>,
+    atb: nalgebra::Vector3<f64>,
 
     /// B^T B term
-    btb: f32,
+    btb: f64,
 
     /// Mass point of intersections is stored as XYZ / W, so that summing works
-    mass_point: nalgebra::Vector4<f32>,
+    mass_point: nalgebra::Vector4<f64>,
 }
 
 impl std::ops::AddAssign for QuadraticErrorSolver {
@@ -27,16 +32,11 @@ impl std::ops::AddAssign for QuadraticErrorSolver {
 
 impl QuadraticErrorSolver {
     pub fn new() -> Self {
-        Self {
-            ata: nalgebra::Matrix3::zeros(),
-            atb: nalgebra::Vector3::zeros(),
-            btb: 0.0,
-            mass_point: nalgebra::Vector4::zeros(),
-        }
+        Self::default()
     }
 
     #[cfg(test)]
-    pub fn mass_point(&self) -> nalgebra::Vector4<f32> {
+    pub fn mass_point(&self) -> nalgebra::Vector4<f64> {
         self.mass_point
     }
 
@@ -51,11 +51,14 @@ impl QuadraticErrorSolver {
         grad: nalgebra::Vector4<f32>,
     ) {
         // TODO: correct for non-zero distance value in grad.w
+        let pos = pos.map(f64::from);
         self.mass_point += nalgebra::Vector4::new(pos.x, pos.y, pos.z, 1.0);
         // A zero gradient (e.g. where an exact distance field is exactly zero
         // and every term's derivative vanishes) gives no plane: normalizing it
         // would poison the whole QEF with NaN, so only the position counts.
-        let Some(norm) = grad.xyz().try_normalize(f32::MIN_POSITIVE) else {
+        let Some(norm) =
+            grad.xyz().map(f64::from).try_normalize(f64::MIN_POSITIVE)
+        else {
             return;
         };
         self.ata += norm * norm.transpose();
@@ -68,8 +71,17 @@ impl QuadraticErrorSolver {
     /// Returns a vertex localized within the given cell, and adjusts the solver
     /// to increase the likelihood that the vertex is bounded in the cell.
     ///
-    /// Also returns the QEF error as the second item in the tuple
+    /// Also returns the QEF error as the second item in the tuple, clamped to
+    /// a small > 0 value (see [`solve_exact`](Self::solve_exact) for the
+    /// error itself)
     pub fn solve(&self) -> (CellVertex<3>, f32) {
+        let (pos, err) = self.solve_exact();
+        (pos, (err as f32).max(1e-6))
+    }
+
+    /// Like [`solve`](Self::solve), with the error unclamped: the sum of the
+    /// squared distances from the vertex to the intersections' planes
+    pub fn solve_exact(&self) -> (CellVertex<3>, f64) {
         // This gets a little tricky; see
         // https://www.mattkeeter.com/projects/qef for a walkthrough of QEF math
         // and references to primary sources.
@@ -98,7 +110,7 @@ impl QuadraticErrorSolver {
         // of 2e3); while the bear model needs to use a rank-2 solver for
         // eigenvalues of [2.87, 0.13, 5.64e-7] (a dynamic range of 10^7).  We
         // pick 10^3 here somewhat arbitrarily to be within that range.
-        const EIGENVALUE_CUTOFF_RELATIVE: f32 = 1e-3;
+        const EIGENVALUE_CUTOFF_RELATIVE: f64 = 1e-3;
         let cutoff = singular_values[0].abs() * EIGENVALUE_CUTOFF_RELATIVE;
 
         // Intuition about `rank`:
@@ -112,14 +124,24 @@ impl QuadraticErrorSolver {
 
         let epsilon = singular_values.get(rank).cloned().unwrap_or(0.0);
         let sol = svd.solve(&atb, epsilon);
-        let pos = sol.map(|c| c + center).unwrap_or(center);
-        // We'll clamp the error to a small > 0 value for ease of comparison
-        let err = ((pos.transpose() * self.ata * pos
-            - 2.0 * pos.transpose() * self.atb)[0]
-            + self.btb)
-            .max(1e-6);
+        let mut pos = sol.map(|c| c + center).unwrap_or(center);
+        if !pos.iter().all(|v| v.is_finite()) {
+            pos = center;
+        }
+        // The error about the mass point, where its terms are small (about
+        // the origin they are large and nearly cancel)
+        let d = pos - center;
+        let c0 = self.btb - 2.0 * center.dot(&self.atb)
+            + (center.transpose() * self.ata * center)[0];
+        let err = ((d.transpose() * self.ata * d)[0] - 2.0 * d.dot(&atb) + c0)
+            .max(0.0);
 
-        (CellVertex { pos }, err)
+        (
+            CellVertex {
+                pos: pos.map(|v| v as f32),
+            },
+            err,
+        )
     }
 }
 
