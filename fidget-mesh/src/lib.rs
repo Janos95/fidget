@@ -60,7 +60,7 @@ use fidget_core::render::{CancelToken, ThreadPool};
 pub mod types;
 
 // Re-export the main Octree type as public
-pub use octree::Octree;
+pub use octree::{Octree, normals};
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -71,6 +71,9 @@ pub struct Mesh {
     pub triangles: Vec<nalgebra::Vector3<usize>>,
     /// Vertex positions
     pub vertices: Vec<nalgebra::Vector3<f32>>,
+    /// Unit surface normal at each vertex: the field's gradient there (zero
+    /// where the field has no direction)
+    pub normals: Vec<nalgebra::Vector3<f32>>,
 }
 
 impl Mesh {

@@ -188,26 +188,26 @@ pub fn dc_edge<T: Frame>(
 
         let verts = verts.map(Option::unwrap);
 
-        // Pick the intersection vertex based on the deepest cell
-        let i = out.vertex(
-            leafs[deepest].index + verts[deepest].edge.0 as usize,
-            &octree.verts,
-        );
-        // Helper function to extract other vertices
-        let mut vert = |i: usize| {
-            out.vertex(leafs[i].index + verts[i].vert.0 as usize, &octree.verts)
-        };
-        let vs = [vert(0), vert(1), vert(2), vert(3)];
-
-        // Pick a triangle winding depending on the edge direction
+        // The intersection vertex comes from the deepest cell; the cell
+        // vertices go around the edge in the winding that makes triangles
+        // face out, each once (two neighbours may be the same larger cell).
         //
         // As always, we have to sample the deepest leaf's edge to be sure that
         // we get the correct value.
+        let center = leafs[deepest].index + verts[deepest].edge.0 as usize;
         let winding = if starting_sign { 3 } else { 1 };
-        for j in 0..4 {
+        let mut ring = arrayvec::ArrayVec::<usize, 4>::new();
+        for k in 0..4 {
+            let j = (k * winding) % 4;
             if cs[j].index != cs[(j + winding) % 4].index {
-                out.triangle(vs[j], vs[(j + winding) % 4], i)
+                ring.push(leafs[j].index + verts[j].vert.0 as usize);
             }
+        }
+        for [a, b, c] in triangulate(octree, &ring, center) {
+            let a = out.vertex(a, octree);
+            let b = out.vertex(b, octree);
+            let c = out.vertex(c, octree);
+            out.triangle(a, b, c);
         }
     } else {
         let (t, u, v) = T::frame();
@@ -223,4 +223,73 @@ pub fn dc_edge<T: Frame>(
             )
         }
     }
+}
+
+/// Triangulates the polygon around one edge (cell vertices `ring`, in order,
+/// and the edge's intersection vertex `center`; indices into the octree's
+/// vertices)
+///
+/// The usual triangulation is a fan around the intersection vertex.  Where the
+/// octree's cells differ in size, a larger cell's vertex can sit so that the
+/// fan folds over: some of its triangles face against the surface.  Then the
+/// ring is split by one of its diagonals instead (or is a single triangle),
+/// whichever folds the least area; the edges shared with the neighbouring
+/// polygons don't change, so the mesh stays watertight.
+fn triangulate(
+    octree: &Octree,
+    ring: &[usize],
+    center: usize,
+) -> arrayvec::ArrayVec<[usize; 3], 4> {
+    let n = ring.len();
+    let fan: arrayvec::ArrayVec<[usize; 3], 4> = (0..n)
+        .map(|j| [ring[j], ring[(j + 1) % n], center])
+        .collect();
+    if n < 3 {
+        return fan;
+    }
+    // Area that faces against the field's normals at the corners (0 if none)
+    let folded = |tris: &[[usize; 3]]| -> f32 {
+        tris.iter()
+            .map(|&[a, b, c]| {
+                let (pa, pb, pc) = (
+                    octree.verts[a].pos,
+                    octree.verts[b].pos,
+                    octree.verts[c].pos,
+                );
+                let r =
+                    octree.normals[a] + octree.normals[b] + octree.normals[c];
+                let r = r.try_normalize(1e-6).unwrap_or_default();
+                (-(pb - pa).cross(&(pc - pa)).dot(&r)).max(0.0)
+            })
+            .sum()
+    };
+    let mut best = folded(&fan);
+    if best == 0.0 {
+        return fan;
+    }
+    let mut out = fan;
+    let splits: arrayvec::ArrayVec<arrayvec::ArrayVec<[usize; 3], 4>, 2> = if n
+        == 3
+    {
+        [[[ring[0], ring[1], ring[2]]].into_iter().collect()]
+            .into_iter()
+            .collect()
+    } else {
+        (0..2)
+            .map(|k| {
+                let q = [ring[k], ring[k + 1], ring[k + 2], ring[(k + 3) % 4]];
+                [[q[0], q[1], q[2]], [q[2], q[3], q[0]]]
+                    .into_iter()
+                    .collect()
+            })
+            .collect()
+    };
+    for tris in splits {
+        let f = folded(&tris);
+        if f < best {
+            best = f;
+            out = tris;
+        }
+    }
+    out
 }

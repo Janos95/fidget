@@ -1,10 +1,5 @@
 //! Mesh builder data structure and implementation
-use super::{
-    Mesh, Octree,
-    cell::{CellIndex, CellVertex},
-    dc,
-    frame::Frame,
-};
+use super::{Mesh, Octree, cell::CellIndex, dc, frame::Frame};
 
 /// Container used during construction of a [`Mesh`]
 #[derive(Default)]
@@ -64,18 +59,15 @@ impl MeshBuilder {
     ///
     /// `v` is an absolute offset into `verts`, which should be a reference to
     /// [`Octree::verts`](super::Octree::verts).
-    pub(crate) fn vertex(
-        &mut self,
-        v: usize,
-        verts: &[CellVertex<3>],
-    ) -> usize {
+    pub(crate) fn vertex(&mut self, v: usize, octree: &Octree) -> usize {
         if v >= self.map.len() {
             self.map.resize(v + 1, usize::MAX);
         }
         match self.map[v] {
             usize::MAX => {
                 let next_vert = self.out.vertices.len();
-                self.out.vertices.push(verts[v].pos);
+                self.out.vertices.push(octree.verts[v].pos);
+                self.out.normals.push(octree.normals[v]);
                 self.map[v] = next_vert;
 
                 next_vert

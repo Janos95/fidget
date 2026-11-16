@@ -31,6 +31,13 @@ pub struct Octree {
     /// This is indexed by cell leaf index; the exact shape depends heavily on
     /// the number of intersections and vertices within each leaf.
     pub(crate) verts: Vec<CellVertex<3>>,
+
+    /// Unit surface normal at each of [`verts`](Self::verts)
+    ///
+    /// During construction, these are the field's raw gradients in the
+    /// octree's frame (NaN where not known yet); [`Octree::build`] turns them
+    /// into unit normals in model space, zero where the field has no direction.
+    pub(crate) normals: Vec<nalgebra::Vector3<f32>>,
 }
 
 impl Octree {
@@ -40,6 +47,7 @@ impl Octree {
             root: Cell::Invalid,
             cells: vec![],
             verts: vec![],
+            normals: vec![],
         }
     }
 
@@ -62,6 +70,37 @@ impl Octree {
                 let q = settings.world_to_model.transform_point(&p);
                 v.pos = q.coords;
             }
+            // Gradients taken in the octree's frame map back by the inverse
+            // transpose of the transform's linear part
+            let m = settings.world_to_model.fixed_view::<3, 3>(0, 0);
+            if let Some(inv) = m.try_inverse() {
+                let it = inv.transpose();
+                for n in &mut out.normals {
+                    *n = it * *n;
+                }
+            }
+        }
+        // Fill in the rest (cell vertices, and gradients that vanish or
+        // aren't finite) by evaluating the field at the vertex itself
+        let m = settings.world_to_model.fixed_view::<3, 3>(0, 0);
+        let cell = m
+            .column(0)
+            .norm()
+            .max(m.column(1).norm())
+            .max(m.column(2).norm())
+            * 2.0
+            / (1u64 << settings.depth.min(63)) as f32;
+        let missing: Vec<usize> = (0..out.normals.len())
+            .filter(|&i| !usable(out.normals[i]))
+            .collect();
+        let points: Vec<_> =
+            missing.iter().map(|&i| out.verts[i].pos).collect();
+        for (i, n) in missing.into_iter().zip(normals(b, &points, 0.05 * cell))
+        {
+            out.normals[i] = n;
+        }
+        for n in &mut out.normals {
+            *n = n.try_normalize(0.0).unwrap_or(nalgebra::Vector3::zeros());
         }
         Some(out)
     }
@@ -172,6 +211,7 @@ impl Octree {
         }
         root.cells.reserve(*cell_offsets.last().unwrap());
         root.verts.reserve(*vert_offsets.last().unwrap());
+        root.normals.reserve(*vert_offsets.last().unwrap());
 
         for (i, o) in out.into_iter().enumerate() {
             assert_eq!(cell_offsets[i], root.cells.len());
@@ -191,6 +231,7 @@ impl Octree {
                 o.octree.cells.into_iter().map(|cs| cs.map(remap_cell)),
             );
             root.verts.extend(o.octree.verts);
+            root.normals.extend(o.octree.normals);
             root[o.cell] = remap_cell(o.octree.root);
         }
 
@@ -340,6 +381,7 @@ impl Octree {
 
         let index = self.verts.len();
         self.verts.push(pos);
+        self.normals.push(nalgebra::Vector3::repeat(f32::NAN));
 
         // Install cell intersections, of which there must only
         // be one (since we only collapse manifold cells)
@@ -348,6 +390,7 @@ impl Octree {
         for e in edges[0] {
             let i = hermite.intersections[e.to_undirected().index()];
             self.verts.push(CellVertex { pos: i.pos.xyz() });
+            self.normals.push(i.grad.xyz());
         }
 
         Some(Leaf { mask, index })
@@ -851,6 +894,17 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
         }
 
         let index = self.octree.verts.len();
+        self.octree.normals.extend(
+            std::iter::repeat_n(
+                nalgebra::Vector3::repeat(f32::NAN),
+                verts.len(),
+            )
+            .chain(
+                grads
+                    .iter()
+                    .map(|g| nalgebra::Vector3::new(g.dx, g.dy, g.dz)),
+            ),
+        );
         self.octree.verts.extend(verts);
         self.octree.verts.extend(
             intersections
@@ -863,6 +917,100 @@ impl<'a, F: Function + RenderHints> OctreeBuilder<'a, F> {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+
+/// Whether a gradient gives a direction
+fn usable(g: nalgebra::Vector3<f32>) -> bool {
+    g.iter().all(|f| f.is_finite()) && g.amax() > 1e-12
+}
+
+/// The field's gradient at each point (model space, not normalized)
+///
+/// Where the gradient doesn't give a direction (it isn't finite, or it
+/// vanishes, as the derivative of a distance does on a sharp edge or exactly
+/// on a polygon's side), it's estimated by central differences with the given
+/// step instead; where that vanishes too, the result is zero.
+pub fn normals<F: Function + RenderHints + Clone>(
+    b: &BoundShape<F, f32>,
+    points: &[nalgebra::Vector3<f32>],
+    step: f32,
+) -> Vec<nalgebra::Vector3<f32>> {
+    const CHUNK: usize = 4096;
+    let (shape, vars) = (b.shape(), b.vars());
+    let mut out = Vec::with_capacity(points.len());
+    if points.is_empty() {
+        return out;
+    }
+    let tape = shape.grad_slice_tape(Default::default());
+    let mut eval = Shape::<F>::new_grad_slice_eval();
+    let (mut xs, mut ys, mut zs) = (vec![], vec![], vec![]);
+    for chunk in points.chunks(CHUNK) {
+        xs.clear();
+        ys.clear();
+        zs.clear();
+        for p in chunk {
+            xs.push(Grad::new(p.x, 1.0, 0.0, 0.0));
+            ys.push(Grad::new(p.y, 0.0, 1.0, 0.0));
+            zs.push(Grad::new(p.z, 0.0, 0.0, 1.0));
+        }
+        let r = eval
+            .eval_raw(
+                &tape,
+                &xs,
+                &ys,
+                &zs,
+                None,
+                ShapeBulkEval::<F::GradSliceEval>::var_value(vars),
+            )
+            .expect("shape and vars are compatible");
+        out.extend(r.iter().map(|g| nalgebra::Vector3::new(g.dx, g.dy, g.dz)));
+    }
+    let bad: Vec<usize> = (0..out.len()).filter(|&i| !usable(out[i])).collect();
+    if !bad.is_empty() {
+        let tape = shape.float_slice_tape(Default::default());
+        let mut eval = Shape::<F>::new_float_slice_eval();
+        let (mut xs, mut ys, mut zs) = (vec![], vec![], vec![]);
+        for chunk in bad.chunks(CHUNK) {
+            xs.clear();
+            ys.clear();
+            zs.clear();
+            for &i in chunk {
+                for axis in 0..3 {
+                    for s in [step, -step] {
+                        let mut q = points[i];
+                        q[axis] += s;
+                        xs.push(q.x);
+                        ys.push(q.y);
+                        zs.push(q.z);
+                    }
+                }
+            }
+            let r = eval
+                .eval_raw(
+                    &tape,
+                    &xs,
+                    &ys,
+                    &zs,
+                    None,
+                    ShapeBulkEval::<F::FloatSliceEval>::var_value(vars),
+                )
+                .expect("shape and vars are compatible");
+            for (k, &i) in chunk.iter().enumerate() {
+                let d = &r[6 * k..6 * k + 6];
+                let g = nalgebra::Vector3::new(
+                    d[0] - d[1],
+                    d[2] - d[3],
+                    d[4] - d[5],
+                );
+                out[i] = if usable(g) {
+                    g
+                } else {
+                    nalgebra::Vector3::zeros()
+                };
+            }
+        }
+    }
+    out
+}
 
 #[derive(Copy, Clone, Default, Debug)]
 struct LeafIntersection {
@@ -1228,6 +1376,72 @@ mod test {
 
             check_for_vertex_dupes(&sphere_mesh).unwrap();
             check_for_edge_matching(&sphere_mesh).unwrap();
+        }
+    }
+
+    /// A torus tilted against the grid, so cells of different sizes meet
+    /// along its curved surface
+    fn tilted_torus() -> Tree {
+        let (x, y, z) = Tree::axes();
+        let (c, s) = (0.4f32.cos(), 0.4f32.sin());
+        let y2 = y.clone() * c - z.clone() * s;
+        let z2 = y * s + z * c;
+        let ring = (x.square() + y2.square()).sqrt() - 0.55;
+        (ring.square() + z2.square()).sqrt() - 0.2
+    }
+
+    #[test]
+    fn test_vertex_normals() {
+        let shape = tree_to_shape(sphere([0.1, 0.0, -0.05], 0.6));
+        for threads in [None, Some(&ThreadPool::Global)] {
+            let settings = Settings {
+                depth: 5,
+                threads,
+                ..Default::default()
+            };
+            let mesh = Octree::build(&shape, &settings).unwrap().walk_dual();
+            assert_eq!(mesh.normals.len(), mesh.vertices.len());
+            for (p, n) in mesh.vertices.iter().zip(&mesh.normals) {
+                let radial =
+                    (p - nalgebra::Vector3::new(0.1, 0.0, -0.05)).normalize();
+                assert!(
+                    (n.norm() - 1.0).abs() < 1e-4,
+                    "{n:?} is not a unit normal"
+                );
+                assert!(n.dot(&radial) > 0.9999, "normal {n:?} at {p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_folds_where_cell_sizes_change() {
+        // Fanning around the edge's intersection folds ~2% of the area here
+        let shape = tree_to_shape(tilted_torus());
+        for threads in [None, Some(&ThreadPool::Global)] {
+            let settings = Settings {
+                depth: 7,
+                threads,
+                ..Default::default()
+            };
+            let mesh = Octree::build(&shape, &settings).unwrap().walk_dual();
+            check_for_vertex_dupes(&mesh).unwrap();
+            check_for_edge_matching(&mesh).unwrap();
+            let (mut total, mut folded) = (0.0, 0.0);
+            for t in &mesh.triangles {
+                let [a, b, c] = [t.x, t.y, t.z].map(|i| mesh.vertices[i]);
+                let n = (b - a).cross(&(c - a));
+                let r =
+                    mesh.normals[t.x] + mesh.normals[t.y] + mesh.normals[t.z];
+                total += n.norm();
+                if n.dot(&r) < 0.0 {
+                    folded += n.norm();
+                }
+            }
+            assert!(
+                folded / total < 1e-3,
+                "{:.3}% of the area folds",
+                100.0 * folded / total
+            );
         }
     }
 
@@ -1781,20 +1995,32 @@ mod test {
                     let (x, y, z) = Tree::axes();
                     let dr = (x.square() + y.square()).sqrt() - 0.5;
                     let dz = z.abs() - 0.6;
-                    (dr.clone().max(0.0).square() + dz.clone().max(0.0).square()).sqrt()
+                    (dr.clone().max(0.0).square()
+                        + dz.clone().max(0.0).square())
+                    .sqrt()
                         + dr.max(dz).min(0.0)
                 }),
                 ("exact box", {
                     let (x, y, z) = Tree::axes();
-                    let (dx, dy, dz) = (x.abs() - 0.5, y.abs() - 0.4, z.abs() - 0.3);
-                    (dx.clone().max(0.0).square() + dy.clone().max(0.0).square() + dz.clone().max(0.0).square()).sqrt()
+                    let (dx, dy, dz) =
+                        (x.abs() - 0.5, y.abs() - 0.4, z.abs() - 0.3);
+                    (dx.clone().max(0.0).square()
+                        + dy.clone().max(0.0).square()
+                        + dz.clone().max(0.0).square())
+                    .sqrt()
                         + dx.max(dy).max(dz).min(0.0)
                 }),
-                ("touching spheres", sphere([-0.3, 0.0, 0.0], 0.3).min(sphere([0.3, 0.0, 0.0], 0.3))),
+                (
+                    "touching spheres",
+                    sphere([-0.3, 0.0, 0.0], 0.3)
+                        .min(sphere([0.3, 0.0, 0.0], 0.3)),
+                ),
                 ("knife edge", {
                     let (x, y, z) = Tree::axes();
                     // a wedge thinning to 0.002 at |y| = 0.8: like a chine or a wing edge
-                    (z.abs() - (0.8 - y.abs()) * 0.05 - 0.002).max(y.abs() - 0.8).max(x.abs() - 0.7)
+                    (z.abs() - (0.8 - y.abs()) * 0.05 - 0.002)
+                        .max(y.abs() - 0.8)
+                        .max(x.abs() - 0.7)
                 }),
             ] {
                 let (b, p) = mesh_report(name, t, depth);
